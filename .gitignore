@@ -3,3 +3,5 @@
 venv/
 .idea/
 __pycache__/
+.mypy_cache/
+pinToActivate.txt
