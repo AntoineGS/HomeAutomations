@@ -5,6 +5,7 @@ from config import config
 from database import set_or_create_db_value, get_db_value
 from datetime import datetime
 from communication import send_sms
+from utils import fahrenheit_to_celsius
 import pytz
 import logging
 from pyecobee.utilities import logger as pyecobee_logger
@@ -13,6 +14,8 @@ from pyecobee.utilities import logger as pyecobee_logger
 AUTH_TOKEN = 'AUTH_TOKEN'
 ACCESS_TOKEN = 'ACCESS_TOKEN'
 REFRESH_TOKEN = 'REFRESH_TOKEN'
+MAX_BASEMENT_TEMP = 23
+MIN_BASEMENT_TEMP = 20
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +52,10 @@ class Ecobee:
             # quit()  # user intervention needed to activate the pin
             input()
 
-        while True:
-            self.refresh_tokens_if_needed()
-            sleep(10)
+        self.refresh_tokens_if_needed()
+
+        # todo: extract threading into main so that all threads are started and managed in the same unit
+        start_ecobee_thread(self)
 
     def save_object(self):
         set_or_create_db_value(AUTH_TOKEN, self.service.authorization_token)
@@ -63,7 +67,7 @@ class Ecobee:
         do_refresh = False
         token_response = None
 
-        if not self.service.refresh_token:
+        if (not self.service.refresh_token) or force_refresh:
             token_response = self.service.request_tokens()
             refreshed = True
         if not refreshed:
@@ -78,24 +82,45 @@ class Ecobee:
         if (refreshed or do_refresh) and (token_response is not None):
             self.save_object()
 
-        thermostat_summary_response = self.service.request_thermostats_summary(selection=Selection(
-            selection_type=SelectionType.REGISTERED.value,
-            selection_match='',
-            include_equipment_status=True))
+    def monitor_basement_temp(self):
+        selection = Selection(selection_type=SelectionType.REGISTERED.value,
+                              selection_match='',
+                              include_sensors=True)
+        thermostat_response = self.service.request_thermostats(selection)
+        found_basement = False
 
-        thermostat_summary_response.pretty_format()
+        for remote_sensor in thermostat_response.thermostat_list[0].remote_sensors:
+            if remote_sensor.name == 'Basement':
+                for capability in remote_sensor.capability:
+                    if capability.type == 'temperature':
+                        found_basement = True
+                        temperature_f = fahrenheit_to_celsius(float(capability.value)/10)
+                        if temperature_f > MAX_BASEMENT_TEMP:
+                            send_sms('Basement temperature is too high ({:.2f}), adjusting...'.format(temperature_f))
+
+                        elif temperature_f < MIN_BASEMENT_TEMP:
+                            send_sms('Basement temperature is too low ({:.2f}), adjusting...'.format(temperature_f))
+                        break  # found the temperature
+                break  # found the basement
+
+        if not found_basement:
+            send_sms('Basement sensor not found')
 
 
 # Note to reader, the use of threads is to facilitate the use of the different timers and division of who does what
 # in addition to being a teaching experience. There will be no real performance boost with this approach due to GIL.
-def start_ecobee_thread() -> Thread:
-    thread = Thread(target=ecobee_loop)
+def start_ecobee_thread(ecobee: Ecobee) -> Thread:
+    thread = Thread(target=ecobee_loop, args=(ecobee,))
     thread.start()
     return thread
 
 
-def ecobee_loop():
-    ecobee = Ecobee
-
+def ecobee_loop(ecobee: Ecobee):
     while True:
-        sleep(30)
+        try:
+            ecobee.monitor_basement_temp()
+        except EcobeeApiException as e:
+            if e.status_code == 14:
+                ecobee.refresh_tokens_if_needed(True)
+
+        sleep(10)
